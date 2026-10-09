@@ -7,7 +7,7 @@
 use super::{FitsError, FitsResult};
 
 const CARD: usize = 80;
-const BLOCK: usize = 2880;
+pub(super) const BLOCK: usize = 2880;
 
 /// Structural keywords a caller must not shadow with metadata.
 pub(super) const RESERVED: &[&str] = &[
@@ -185,14 +185,19 @@ impl Header {
     }
 
     /// Emit `END` and pad the header to a 2880-byte boundary with spaces.
-    pub(super) fn finish(mut self) -> Vec<u8> {
-        self.raw("END");
-        let rem = self.buf.len() % BLOCK;
-        if rem != 0 {
-            self.buf.resize(self.buf.len() + (BLOCK - rem), b' ');
-        }
-        self.buf
+    pub(super) fn finish(self) -> Vec<u8> {
+        end_block(self.buf)
     }
+}
+
+/// Whole 80-byte `cards` followed by `END`, padded to a 2880-byte boundary with
+/// spaces.
+pub(super) fn end_block(mut cards: Vec<u8>) -> Vec<u8> {
+    let start = cards.len();
+    cards.extend_from_slice(b"END");
+    cards.resize(start + CARD, b' ');
+    cards.resize(cards.len().div_ceil(BLOCK) * BLOCK, b' ');
+    cards
 }
 
 /// Pad a string to at least 8 characters with trailing spaces (FITS minimum string

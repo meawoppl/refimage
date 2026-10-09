@@ -1,32 +1,31 @@
-//! The tile-compressed `BINTABLE` HDU (`ZIMAGE` convention).
+//! Tile grids and float quantization for the compressed writers, and the
+//! `HCOMPRESS_1` tile-compressed `BINTABLE` HDU (`ZIMAGE` convention).
 //!
-//! Tiling is resolved here from the caller's [`Tiling`] choice and the concrete image
+//! `GZIP_1` and `RICE_1` tiles are compressed by `fitsio_pure::compress`
+//! (`mod.rs`); `HCOMPRESS_1` is built here. Both take their tile grid and their
+//! float quantization from this module, so the three algorithms tile and quantize
+//! alike.
+//!
+//! Tiling is resolved from the caller's [`Tiling`] choice and the concrete image
 //! size: the default is one image row per tile for `GZIP_1` / `RICE_1` and one whole
 //! channel plane for `HCOMPRESS_1`, but [`Rice::tile_rows`](super::Rice::tile_rows) /
 //! [`Rice::tile_dims`](super::Rice::tile_dims) (and the same on the other builders) pick
 //! any rectangular grid. Tiles are numbered fastest-FITS-axis-first; edge tiles are
-//! clipped, not padded. Each tile is compressed independently; the bytes are
-//! concatenated into the table heap and pointed at by a `1PB` variable-length-array
-//! descriptor per row.
+//! clipped, not padded.
 //!
-//! Integer images (`u8` / `u16`) compress losslessly. `f32` + `Rice` / `Hcompress`
-//! quantizes each tile to 32-bit integers first ([`quantize`]); `ZSCALE` is constant and
-//! `ZZERO` is per-tile, both written as `1D` columns alongside `COMPRESSED_DATA`.
+//! `f32` + `Rice` / `Hcompress` is quantized to 32-bit integers with one global step
+//! for the whole image ([`quantize::global_delta`]); `ZSCALE` is constant and `ZZERO`
+//! is per-tile, both written as `1D` columns alongside `COMPRESSED_DATA`.
 
-use super::config::{DitherSeed, Method, Quantize, Tiling};
-use super::hdu::{ImageView, Tile};
-use super::{gzip, hcompress, quantize, rice, FitsError, FitsResult};
+use super::config::{DitherSeed, Quantize, Tiling};
+use super::hdu::ImageView;
+use super::{hcompress, quantize, FitsError, FitsResult};
 
-/// Everything `mod.rs` needs to emit a compressed image HDU.
+/// Everything `mod.rs` needs to emit an `HCOMPRESS_1` image HDU.
 pub(super) struct Compressed {
-    pub zcmptype: &'static str,
     pub zbitpix: i64,
     pub zaxes: Vec<usize>,
     pub ztiles: Vec<usize>,
-    pub bytepix: usize,
-    pub is_rice: bool,
-    /// `true` for `HCOMPRESS_1` — emits the `SCALE` / `SMOOTH` `ZNAME` cards.
-    pub is_hcompress: bool,
     /// HCOMPRESS scale factor (`ZVAL1`); `0` = lossless.
     pub hscale: i64,
     /// HCOMPRESS `SMOOTH` flag (`ZVAL2`).
@@ -41,71 +40,21 @@ pub(super) struct Compressed {
     pub data: Vec<u8>,
 }
 
-/// The chosen algorithm plus its resolved settings.
-enum Algo {
-    Gzip {
-        level: u8,
-    },
-    Rice(Quantize),
-    Hcompress {
-        scale: i32,
-        smooth: bool,
-        quantize: Quantize,
-    },
-}
-
-impl Algo {
-    fn is_hcompress(&self) -> bool {
-        matches!(self, Algo::Hcompress { .. })
-    }
-    fn hscale(&self) -> i32 {
-        match self {
-            Algo::Hcompress { scale, .. } => *scale,
-            _ => 0,
-        }
-    }
-    fn quantize(&self) -> Option<Quantize> {
-        match self {
-            Algo::Gzip { .. } => None,
-            Algo::Rice(q) => Some(*q),
-            Algo::Hcompress { quantize, .. } => Some(*quantize),
-        }
-    }
-}
-
-pub(super) fn build(view: &ImageView<'_>, method: &Method) -> FitsResult<Compressed> {
-    let (tiling, algo) = match method {
-        Method::None => unreachable!("caller handles None"),
-        Method::Gzip { tiling, level } => (tiling, Algo::Gzip { level: *level }),
-        Method::Rice { tiling, quantize } => (tiling, Algo::Rice(*quantize)),
-        Method::Hcompress {
-            tiling,
-            scale,
-            smooth,
-            quantize,
-        } => (
-            tiling,
-            Algo::Hcompress {
-                scale: *scale,
-                smooth: *smooth,
-                quantize: *quantize,
-            },
-        ),
-    };
-    build_tiled(view, tiling, &algo)
-}
-
 /// The tile grid, resolved against the image size.
-struct Grid {
+pub(super) struct Grid {
     tx: usize,
     ty: usize,
     ntx: usize,
     nty: usize,
     /// `ZTILE1..ZTILEn`.
-    ztile: Vec<usize>,
+    pub ztile: Vec<usize>,
 }
 
-fn resolve_grid(view: &ImageView<'_>, tiling: &Tiling, hcompress: bool) -> FitsResult<Grid> {
+pub(super) fn resolve_grid(
+    view: &ImageView<'_>,
+    tiling: &Tiling,
+    hcompress: bool,
+) -> FitsResult<Grid> {
     let axes = view.axes();
     let (mut tx, mut ty) = match tiling {
         Tiling::Default => {
@@ -157,26 +106,30 @@ fn resolve_grid(view: &ImageView<'_>, tiling: &Tiling, hcompress: bool) -> FitsR
     })
 }
 
-fn build_tiled(view: &ImageView<'_>, tiling: &Tiling, algo: &Algo) -> FitsResult<Compressed> {
-    let grid = resolve_grid(view, tiling, algo.is_hcompress())?;
-
-    // Global quantization parameters (only for `f32` + Rice/Hcompress).
-    let quant = match algo.quantize() {
-        Some(q) if view.is_float() => {
-            let planar = view.planar_f32();
-            let delta = quantize::global_delta(&planar, view.w, view.h * view.ch, q.level);
-            let seed = match q.seed {
-                DitherSeed::Auto => {
-                    let tw = grid.tx.min(view.w);
-                    let th = grid.ty.min(view.h);
-                    quantize::dither_seed(&view.rect_f32(0, 0, 0, tw, th))
-                }
-                DitherSeed::Fixed(n) => n.clamp(1, 10_000),
-            };
-            Some((delta, seed))
+/// The global quantization step and the dither seed (`ZDITHER0`) for an `f32` image.
+pub(super) fn global_quant(view: &ImageView<'_>, grid: &Grid, q: &Quantize) -> (f64, u32) {
+    let planar = view.planar_f32();
+    let delta = quantize::global_delta(&planar, view.w, view.h * view.ch, q.level);
+    let seed = match q.seed {
+        DitherSeed::Auto => {
+            let tw = grid.tx.min(view.w);
+            let th = grid.ty.min(view.h);
+            quantize::dither_seed(&view.rect_f32(0, 0, 0, tw, th))
         }
-        _ => None,
+        DitherSeed::Fixed(n) => n.clamp(1, 10_000),
     };
+    (delta, seed)
+}
+
+pub(super) fn hcompress(
+    view: &ImageView<'_>,
+    tiling: &Tiling,
+    scale: i32,
+    smooth: bool,
+    q: &Quantize,
+) -> FitsResult<Compressed> {
+    let grid = resolve_grid(view, tiling, true)?;
+    let quant = view.is_float().then(|| global_quant(view, &grid, q));
 
     let quantized = quant.is_some();
     let row_bytes = if quantized { 24 } else { 8 };
@@ -196,30 +149,12 @@ fn build_tiled(view: &ImageView<'_>, tiling: &Tiling, algo: &Algo) -> FitsResult
 
                 let (compressed, zzero) = if let Some((delta, seed)) = quant {
                     let f = view.rect_f32(plane, x0, y0, tw, th);
-                    let q = quantize::quantize_tile(&f, delta, tile_index, seed);
-                    let bytes = if algo.is_hcompress() {
-                        let mut d = q.idata;
-                        hcompress::compress(&mut d, tw, th, algo.hscale())
-                    } else {
-                        rice::encode_int(&q.idata)
-                    };
+                    let mut q = quantize::quantize_tile(&f, delta, tile_index, seed);
+                    let bytes = hcompress::compress(&mut q.idata, tw, th, scale);
                     (bytes, Some(q.zzero))
                 } else {
-                    let bytes = match algo {
-                        Algo::Gzip { level } => {
-                            gzip::gzip(&view.rect_tile(plane, x0, y0, tw, th).to_be_bytes(), *level)
-                        }
-                        Algo::Rice(_) => match view.rect_tile(plane, x0, y0, tw, th) {
-                            Tile::I16(v) => rice::encode_short(&v),
-                            Tile::I8(v) => rice::encode_byte(&v),
-                            Tile::F32(_) => unreachable!("float is quantized"),
-                        },
-                        Algo::Hcompress { scale, .. } => {
-                            let mut d = view.rect_i32(plane, x0, y0, tw, th);
-                            hcompress::compress(&mut d, tw, th, *scale)
-                        }
-                    };
-                    (bytes, None)
+                    let mut d = view.rect_i32(plane, x0, y0, tw, th);
+                    (hcompress::compress(&mut d, tw, th, scale), None)
                 };
 
                 let offset = heap.len() as i32;
@@ -240,26 +175,12 @@ fn build_tiled(view: &ImageView<'_>, tiling: &Tiling, algo: &Algo) -> FitsResult
     let mut data = table;
     data.extend_from_slice(&heap);
 
-    let (zcmptype, is_rice, is_hcompress, hscale, hsmooth) = match algo {
-        Algo::Gzip { .. } => ("GZIP_1", false, false, 0i64, false),
-        Algo::Rice(_) => ("RICE_1", true, false, 0, false),
-        Algo::Hcompress { scale, smooth, .. } => {
-            ("HCOMPRESS_1", false, true, *scale as i64, *smooth)
-        }
-    };
-    // BYTEPIX for Rice: 4 for quantized floats, else the pixel width.
-    let bytepix = if quantized { 4 } else { view.bytepix() };
-
     Ok(Compressed {
-        zcmptype,
         zbitpix: view.bitpix(),
         zaxes: view.axes(),
         ztiles: grid.ztile,
-        bytepix,
-        is_rice,
-        is_hcompress,
-        hscale,
-        hsmooth,
+        hscale: scale as i64,
+        hsmooth: smooth,
         quant: quant.map(|(_, seed)| seed),
         naxis2: n_tiles,
         pcount,

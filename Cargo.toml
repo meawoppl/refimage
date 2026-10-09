@@ -30,8 +30,8 @@ include = [
 bytemuck = "1.23"
 chrono = { version = "0.4.31", default-features = false, features = ["alloc", "serde"] }
 crc32fast = "1.5"
+fitsio-pure = "0.21.1"
 indexmap = { version = "2", features = ["serde"] }
-miniz_oxide = "0.8"
 num-traits = "0.2.19"
 paste = "1.0"
 serde = { version = "1.0", features = ["derive"] }

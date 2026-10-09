@@ -2,6 +2,19 @@
 
 ## Changes
 
+### Unreleased
+
+- `GZIP_1` and `RICE_1` tiles are now encoded by
+  [`fitsio-pure`](https://crates.io/crates/fitsio-pure)'s `compress` module, a
+  pure-Rust (no_std, wasm32) port of cfitsio's encoders that is checked against
+  cfitsio in its CI. The crate's own `rice.rs` and `gzip.rs` are removed, and so is
+  the `miniz_oxide` dependency. `HCOMPRESS_1`, the tile grid and the global `f32`
+  quantization step are still computed here, so every builder setting behaves as
+  before. Output is the same size and decodes to the same values in astropy,
+  quantized `f32` included. Lossless `GZIP_1` floats now carry
+  `ZQUANTIZ = 'NONE'`, as cfitsio writes them.
+- `FitsError::Compression` reports a `fitsio-pure` encoding failure.
+
 ### 1.0.0-pre6 (2026-09-03)
 
 - **Breaking:** `PixelType` now has only the six variants the crate can actually

@@ -124,6 +124,7 @@ assert_eq!((luma.width(), luma.height()), (48, 48));
 `GenericImageRef` / `GenericImageOwned` can be stored to FITS via the `FitsWrite` trait.
 It writes uncompressed images (`FitsCompression::NONE`) and the tile-compression convention through the builder structs `Gzip`, `Rice` and `Hcompress` (anything `Into<FitsCompression>`).
 `Gzip` is lossless for any pixel type; `Rice` and `Hcompress` are lossless for `u8`/`u16` and quantize `f32` with `SUBTRACTIVE_DITHER_1`.
+`Gzip` and `Rice` tiles are encoded by the pure-Rust [`fitsio-pure`](https://crates.io/crates/fitsio-pure) crate, whose encoders are checked against cfitsio.
 Tile shape is set with `tile_rows(n)` or `tile_dims([nx, ny])`, defaulting to one image row per tile for `Rice`/`Gzip` and one whole channel plane for `Hcompress` (the H-transform + quadtree coder, min. tile 4×4); `Rice`/`Hcompress` also take a `Quantize` (level / dither seed) and `Hcompress` a `scale` / `smooth`.
 Multi-channel images are stored planar, `u16` carries `BZERO = 32768`, and metadata is stored in header cards (`HIERARCH` for long keys, `CONTINUE` for long strings).
 `FitsWrite::fits_bytes` returns a single image as a `Vec<u8>` (in-memory), and `create_fits_to(sink, compression)` builds a multi-HDU file into a `Write` sink (`create_fits` is the on-disk equivalent).

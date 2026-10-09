@@ -65,11 +65,9 @@ mod card;
 mod compress;
 mod config;
 mod datetime;
-mod gzip;
 mod hcompress;
 mod hdu;
 mod quantize;
-mod rice;
 
 use chrono::{DateTime, Utc};
 use std::fs::OpenOptions;
@@ -81,7 +79,8 @@ use crate::{GenericLineItem, GenericValue, Metadata, EXPOSURE_KEY, FRAMEID_KEY};
 
 use card::Header;
 use config::Method;
-use hdu::{bayer_pattern, colorspace_str, ImageView};
+use fitsio_pure::compress::{compress_image_hdu, TileCompression};
+use hdu::{bayer_pattern, colorspace_str, ImageView, Planar};
 
 pub use config::{
     AutoTile, DitherSeed, FitsCompression, FitsCompressionKind, FixedTile, Gzip, Hcompress,
@@ -110,6 +109,9 @@ pub enum FitsError {
     /// A tile specification could not be applied to the image.
     #[error("invalid tile specification: {0}")]
     InvalidTiling(String),
+    /// `fitsio-pure` could not tile-compress the image.
+    #[error("tile compression failed: {0}")]
+    Compression(String),
 }
 
 /// `Result` alias for [`FitsError`].
@@ -226,7 +228,18 @@ fn write_one<W: Write>(
             if lead_primary {
                 sink.write_all(&primary_empty())?;
             }
-            write_compressed(view, meta, method, &mut sink)?;
+            match method {
+                Method::Hcompress {
+                    tiling,
+                    scale,
+                    smooth,
+                    quantize,
+                } => {
+                    let c = compress::hcompress(view, tiling, *scale, *smooth, quantize)?;
+                    write_hcompress(view, meta, &c, &mut sink)?;
+                }
+                _ => write_tiled(view, meta, method, &mut sink)?,
+            }
         }
     }
     Ok(())
@@ -369,14 +382,78 @@ fn write_uncompressed<W: Write>(
     Ok(())
 }
 
-/// A tile-compressed image HDU (`BINTABLE` with `ZIMAGE = T`), streamed to `sink`.
-fn write_compressed<W: Write>(
+/// A `GZIP_1` or `RICE_1` tile-compressed image HDU (`BINTABLE` with `ZIMAGE = T`),
+/// written to `sink`. `fitsio_pure::compress` writes the table and its compression
+/// keywords; this crate's own cards follow them, before `END`.
+fn write_tiled<W: Write>(
     view: &ImageView<'_>,
     meta: &Metadata,
     method: &Method,
     sink: &mut W,
 ) -> FitsResult<()> {
-    let c = compress::build(view, method)?;
+    let (tiling, opts, quantize) = match method {
+        Method::Gzip { tiling, level } => (
+            tiling,
+            TileCompression::gzip().gzip_level(*level).lossless(),
+            None,
+        ),
+        Method::Rice { tiling, quantize } => (tiling, TileCompression::rice(), Some(quantize)),
+        Method::None | Method::Hcompress { .. } => unreachable!("written elsewhere"),
+    };
+    let grid = compress::resolve_grid(view, tiling, false)?;
+    let mut opts = opts.tile_dims(&grid.ztile);
+    if let Some(q) = quantize.filter(|_| view.is_float()) {
+        let (delta, seed) = compress::global_quant(view, &grid, q);
+        // One global step in every tile, as `HCOMPRESS_1` uses.
+        opts = opts.quantize(
+            fitsio_pure::compress::Quantize::new()
+                .step(delta)
+                .seed(fitsio_pure::compress::DitherSeed::Fixed(seed as u16)),
+        );
+    }
+    let naxes = view.axes();
+    let hdu = match view.planar() {
+        Planar::U8(p) => compress_image_hdu(&naxes, &p, &opts, &[]),
+        Planar::U16(p) => compress_image_hdu(&naxes, &p, &opts, &[]),
+        Planar::F32(p) => compress_image_hdu(&naxes, &p, &opts, &[]),
+    }
+    .map_err(|e| FitsError::Compression(e.to_string()))?;
+
+    // `fitsio-pure` writes `BZERO`/`BSCALE` for `u16` itself.
+    let mut h = Header::new();
+    if let Some(bits) = view.adc_bits {
+        h.integer("BITADC", bits as i64, Some("meaningful ADC bits per sample"))?;
+    }
+    write_common_cards(&mut h, view, meta.timestamp())?;
+    write_metadata(&mut h, meta)?;
+    let ours = h.finish();
+
+    let theirs = header_cards(&hdu);
+    let data = &hdu[(theirs.len() + 80).div_ceil(card::BLOCK) * card::BLOCK..];
+    let mut header = theirs.to_vec();
+    header.extend_from_slice(header_cards(&ours));
+    sink.write_all(&card::end_block(header))?;
+    sink.write_all(data)?;
+    Ok(())
+}
+
+/// The 80-byte cards of the header at the start of `bytes`, `END` excluded.
+fn header_cards(bytes: &[u8]) -> &[u8] {
+    let end = bytes
+        .chunks(80)
+        .position(|c| c.starts_with(b"END     "))
+        .expect("a serialised header ends with END");
+    &bytes[..end * 80]
+}
+
+/// An `HCOMPRESS_1` tile-compressed image HDU (`BINTABLE` with `ZIMAGE = T`),
+/// streamed to `sink`.
+fn write_hcompress<W: Write>(
+    view: &ImageView<'_>,
+    meta: &Metadata,
+    c: &compress::Compressed,
+    sink: &mut W,
+) -> FitsResult<()> {
     let quantized = c.quant.is_some();
     let mut h = Header::new();
 
@@ -402,7 +479,7 @@ fn write_compressed<W: Write>(
     }
 
     h.logical("ZIMAGE", true, Some("tile-compressed image"))?;
-    h.string("ZCMPTYPE", c.zcmptype, Some("compression algorithm"))?;
+    h.string("ZCMPTYPE", "HCOMPRESS_1", Some("compression algorithm"))?;
     h.integer("ZBITPIX", c.zbitpix, Some("data type of original image"))?;
     h.integer("ZNAXIS", c.zaxes.len() as i64, None)?;
     for (i, &n) in c.zaxes.iter().enumerate() {
@@ -411,18 +488,10 @@ fn write_compressed<W: Write>(
     for (i, &n) in c.ztiles.iter().enumerate() {
         h.integer(&format!("ZTILE{}", i + 1), n as i64, None)?;
     }
-    if c.is_rice {
-        h.string("ZNAME1", "BLOCKSIZE", None)?;
-        h.integer("ZVAL1", 32, None)?;
-        h.string("ZNAME2", "BYTEPIX", None)?;
-        h.integer("ZVAL2", c.bytepix as i64, None)?;
-    }
-    if c.is_hcompress {
-        h.string("ZNAME1", "SCALE", Some("HCOMPRESS scale factor"))?;
-        h.real("ZVAL1", c.hscale as f64, Some("HCOMPRESS scale factor"))?;
-        h.string("ZNAME2", "SMOOTH", Some("HCOMPRESS smooth option"))?;
-        h.integer("ZVAL2", c.hsmooth as i64, Some("HCOMPRESS smooth option"))?;
-    }
+    h.string("ZNAME1", "SCALE", Some("HCOMPRESS scale factor"))?;
+    h.real("ZVAL1", c.hscale as f64, Some("HCOMPRESS scale factor"))?;
+    h.string("ZNAME2", "SMOOTH", Some("HCOMPRESS smooth option"))?;
+    h.integer("ZVAL2", c.hsmooth as i64, Some("HCOMPRESS smooth option"))?;
     if let Some(zdither0) = c.quant {
         h.string(
             "ZQUANTIZ",

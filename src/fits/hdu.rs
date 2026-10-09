@@ -34,25 +34,12 @@ enum Pixels<'a> {
     F32(&'a [f32]),
 }
 
-/// One image tile (a single row of one plane) in its FITS-native form.
-pub(super) enum Tile {
-    /// Signed 16-bit (`u16` image, already offset by `-32768`).
-    I16(Vec<i16>),
-    /// Signed 8-bit (`u8` image reinterpreted).
-    I8(Vec<i8>),
-    /// 32-bit float values (`f32` image).
+/// The image's pixels in planar order (`NAXIS1` fastest, one channel plane after
+/// another), as `fitsio_pure::compress` takes them.
+pub(super) enum Planar {
+    U8(Vec<u8>),
+    U16(Vec<u16>),
     F32(Vec<f32>),
-}
-
-impl Tile {
-    /// FITS-native big-endian bytes for this tile.
-    pub(super) fn to_be_bytes(&self) -> Vec<u8> {
-        match self {
-            Tile::I8(v) => v.iter().map(|&x| x as u8).collect(),
-            Tile::I16(v) => v.iter().flat_map(|x| x.to_be_bytes()).collect(),
-            Tile::F32(v) => v.iter().flat_map(|x| x.to_be_bytes()).collect(),
-        }
-    }
 }
 
 impl<'a> ImageView<'a> {
@@ -149,21 +136,19 @@ impl<'a> ImageView<'a> {
         })
     }
 
-    /// A rectangular tile of one plane, row-major, in FITS-native form. `u8` is
-    /// reinterpreted signed, `u16` is offset by `-32768`, `f32` passes through.
-    pub(super) fn rect_tile(
-        &self,
-        plane: usize,
-        x0: usize,
-        y0: usize,
-        tw: usize,
-        th: usize,
-    ) -> Tile {
-        let idx = self.rect_indices(plane, x0, y0, tw, th);
+    /// The whole image de-interleaved into planar order, pixel values unchanged.
+    pub(super) fn planar(&self) -> Planar {
+        fn deinterleave<T: Copy>(p: &[T], ch: usize) -> Vec<T> {
+            let mut out = Vec::with_capacity(p.len());
+            for plane in 0..ch {
+                out.extend(p[plane..].iter().step_by(ch).copied());
+            }
+            out
+        }
         match self.pixels {
-            Pixels::U8(p) => Tile::I8(idx.map(|i| p[i] as i8).collect()),
-            Pixels::U16(p) => Tile::I16(idx.map(|i| (p[i] as i32 - 32768) as i16).collect()),
-            Pixels::F32(p) => Tile::F32(idx.map(|i| p[i]).collect()),
+            Pixels::U8(p) => Planar::U8(deinterleave(p, self.ch)),
+            Pixels::U16(p) => Planar::U16(deinterleave(p, self.ch)),
+            Pixels::F32(p) => Planar::F32(deinterleave(p, self.ch)),
         }
     }
 

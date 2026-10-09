@@ -154,9 +154,10 @@ fn float_compresses_both_ways() {
         DynamicImageOwned::from(ImageOwned::from_owned(data, 64, 8, ColorSpace::Gray).unwrap());
     let g = GenericImageOwned::new(ts(), Duration::ZERO, img);
 
-    // Gzip: lossless raw float bytes, no quantization keywords.
+    // Gzip: lossless raw float bytes, marked `ZQUANTIZ = 'NONE'` as cfitsio marks them.
     let gz = g.fits_bytes(Gzip::new()).unwrap();
-    assert!(find_card(&gz, "ZQUANTIZ").is_none());
+    assert!(find_card(&gz, "ZQUANTIZ").unwrap().contains("'NONE "));
+    assert!(find_card(&gz, "ZDITHER0").is_none());
 
     // Rice: quantized, so ZQUANTIZ / ZDITHER0 / ZSCALE column appear.
     let rc = g.fits_bytes(Rice::new()).unwrap();

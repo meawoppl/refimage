@@ -216,6 +216,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fitsio-pure"
+version = "0.21.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a69aab257aa782d25d7437befdb8ec3b597e36eecb4bf42a4744ddaa5aeb287c"
+dependencies = [
+ "bytemuck",
+ "libm",
+ "miniz_oxide 0.9.1",
+]
+
+[[package]]
 name = "fitsio-sys"
 version = "0.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -684,9 +695,9 @@ dependencies = [
  "chrono",
  "crc32fast",
  "fitsio",
+ "fitsio-pure",
  "image",
  "indexmap",
- "miniz_oxide 0.8.9",
  "num-traits",
  "paste",
  "rand 0.10.2",
